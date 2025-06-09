@@ -3,9 +3,11 @@ import re
 import json
 import asyncio
 from datetime import datetime
-from typing import List
+from typing import List, Any, Dict
 
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from psycopg2.pool import SimpleConnectionPool
 from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 from prometheus_fastapi_instrumentator import Instrumentator
@@ -13,7 +15,18 @@ from prometheus_client import Histogram
 from loguru import logger
 import redis.asyncio as redis
 
-from shared.config import REDIS_HOST, REDIS_PORT
+from shared.config import (
+    REDIS_HOST,
+    REDIS_PORT,
+    PGHOST,
+    PGPORT,
+    PGUSER,
+    PGPASSWORD,
+    PGDATABASE,
+)
+
+from .models import FileRecord
+from .utils import ALLOWED_EXTENSIONS, determine_source, extract_content
 
 # FastAPI app initialization
 app = FastAPI(title="Genio EXPRESS Semantic Encoding Service")
@@ -38,7 +51,51 @@ NOW_CHANNEL = os.getenv("NOW_CHANNEL", "now_channel")
 EXPRESS_CHANNEL = os.getenv("EXPRESS_CHANNEL", "express_channel")
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "32"))
 
+# PostgreSQL connection pool placeholder
+DB_POOL: SimpleConnectionPool | None = None
+
 model = SentenceTransformer(MODEL_NAME)
+
+
+# Database helpers ----------------------------------------------------------
+
+
+def get_pool() -> SimpleConnectionPool:
+    """Return initialized connection pool."""
+    global DB_POOL
+    if DB_POOL is None:
+        DB_POOL = SimpleConnectionPool(
+            minconn=1,
+            maxconn=10,
+            host=PGHOST,
+            port=PGPORT,
+            user=PGUSER,
+            password=PGPASSWORD,
+            dbname=PGDATABASE,
+        )
+    return DB_POOL
+
+
+def init_db() -> None:
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS express_files (
+                    id SERIAL PRIMARY KEY,
+                    filename TEXT,
+                    source TEXT,
+                    content TEXT,
+                    timestamp TIMESTAMPTZ,
+                    meta JSONB
+                )
+                """
+            )
+            conn.commit()
+    finally:
+        pool.putconn(conn)
 
 
 # Request and Response Schemas
@@ -122,6 +179,7 @@ async def process_batch(batch):
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(handle_now_channel())
+    init_db()
 
 
 # HTTP API endpoint for single embedding generation
@@ -146,11 +204,101 @@ async def encode(req: EncodeRequest):
     )
 
 
+# ---------------------------------------------------------------------------
+# File upload endpoint
+# ---------------------------------------------------------------------------
+
+
+@app.post("/upload")
+async def upload(
+    file: UploadFile = File(...),
+    well_id: str = Form(...),
+    field: str = Form(...),
+    district: str = Form(...),
+    operator: str = Form(...),
+    document_type: str = Form(...),
+) -> Dict[str, Any]:
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        logger.warning(f"Unsupported file type: {ext}")
+        raise HTTPException(status_code=400, detail="Unsupported file type")
+
+    content_bytes = await file.read()
+    try:
+        content = extract_content(content_bytes, ext)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Failed to extract content: {e}")
+        raise HTTPException(status_code=400, detail="Failed to extract content")
+
+    source = determine_source(ext)
+    timestamp = datetime.utcnow()
+
+    meta = {
+        "field": field,
+        "district": district,
+        "operator": operator,
+        "document_type": document_type,
+    }
+
+    record = FileRecord(
+        filename=file.filename,
+        source=source,
+        content=content,
+        timestamp=timestamp,
+        meta=meta,
+    )
+
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO express_files (filename, source, content, timestamp, meta) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (
+                    record.filename,
+                    record.source,
+                    record.content,
+                    record.timestamp,
+                    json.dumps(record.meta),
+                ),
+            )
+            conn.commit()
+    except Exception as e:  # noqa: BLE001
+        conn.rollback()
+        logger.error(f"DB insert failed: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+    finally:
+        pool.putconn(conn)
+
+    payload = {
+        "filename": record.filename,
+        "content": record.content,
+        "well_id": well_id,
+        "meta": meta,
+    }
+
+    interpret_url = os.getenv("INTERPRET_URL", "http://interpret_service:8000/ingest")
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(interpret_url, json=payload, timeout=10)
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Forwarding to interpret-service failed: {e}")
+        raise HTTPException(status_code=502, detail="Interpret service error")
+
+    return {
+        "filename": record.filename,
+        "source": source,
+        "timestamp": timestamp.isoformat(),
+    }
+
+
 # Enhanced health check endpoint
 @app.get("/health")
 async def detailed_healthcheck():
     redis_status = "ok"
     model_status = "ok"
+    db_status = "ok"
 
     try:
         await redis_client.ping()
@@ -162,10 +310,19 @@ async def detailed_healthcheck():
     except Exception as e:
         model_status = f"error: {str(e)}"
 
+    try:
+        pool = get_pool()
+        conn = pool.getconn()
+        conn.cursor().execute("SELECT 1")
+        pool.putconn(conn)
+    except Exception as e:  # noqa: BLE001
+        db_status = f"error: {e}"
+
     return {
         "status": "active",
         "redis": redis_status,
         "model": model_status,
+        "database": db_status,
         "timestamp": datetime.utcnow().isoformat(),
     }
 

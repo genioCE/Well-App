@@ -4,3 +4,7 @@ sentence-transformers
 redis[hiredis]
 loguru
 prometheus-fastapi-instrumentator
+httpx
+psycopg2-binary
+python-multipart
+PyMuPDF
