@@ -7,3 +7,5 @@ uvicorn[standard]
 loguru
 prometheus-fastapi-instrumentator
 prometheus-client
+openai
+qdrant-client

@@ -1,13 +1,20 @@
 from fastapi import FastAPI, HTTPException
 from shared.redis_utils import subscribe, publish
 from shared.logger import logger
+from shared.qdrant_client import insert_embedding_with_stage
 import threading
 import json
 import spacy
 import os
 from datetime import datetime
-from schemas import PruneRequest, PruneResponse
+from schemas import (
+    PruneRequest,
+    PruneResponse,
+    InterpretRequest,
+    InterpretResponse,
+)
 from pruning import prune_embedding
+from .utils import summarize, extract_tags, prune_content, get_embedding
 from loguru import logger
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import Histogram, Counter
@@ -130,6 +137,49 @@ def detailed_healthcheck():
 @app.get("/")
 def healthcheck():
     return {"status": "interpret_service active"}
+
+
+@app.post("/interpret", response_model=InterpretResponse)
+async def interpret(req: InterpretRequest):
+    """Process well document content and store embedding."""
+    try:
+        summary = summarize(req.content)
+        tags = extract_tags(req.content)
+        pruned = prune_content(req.content)
+        embedding = get_embedding(pruned)
+    except Exception as exc:  # noqa: BLE001
+        interpret_errors.inc()
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    ts = datetime.utcnow()
+    metadata = {
+        "well_id": req.well_id,
+        "filename": req.filename,
+        "field": req.meta.field,
+        "district": req.meta.district,
+        "operator": req.meta.operator,
+        "document_type": req.meta.document_type,
+        "timestamp": ts.isoformat(),
+        "stage": "interpret",
+        "layer": "raw",
+    }
+
+    try:
+        insert_embedding_with_stage("well_docs", embedding, metadata)
+    except Exception as exc:  # noqa: BLE001
+        interpret_errors.inc()
+        raise HTTPException(status_code=500, detail=f"Qdrant error: {exc}")
+
+    return InterpretResponse(
+        well_id=req.well_id,
+        filename=req.filename,
+        summary=summary,
+        tags=tags,
+        embedding=embedding,
+        pruned_content=pruned,
+        meta=req.meta,
+        timestamp=ts,
+    )
 
 
 @app.post("/prune", response_model=PruneResponse)
