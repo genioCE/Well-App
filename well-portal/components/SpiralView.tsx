@@ -12,29 +12,34 @@ interface Props {
 export default function SpiralView({ wellId, onSelect }: Props) {
   const [points, setPoints] = useState<MemoryPoint[]>([]);
   const [filters, setFilters] = useState<SpiralFilterState>({
-    stage: 'both',
+    stage: 'reflect',
     layer: 'both',
     tag: '',
   });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
 
   useEffect(() => {
-    fetchSpiral(wellId)
-      .then((d) => setPoints(d.points || []))
-      .catch(() => {
-        // fallback placeholder data
-        setPoints([
-          {
-            id: '1',
-            summary: 'Placeholder memory',
-            timestamp: new Date().toISOString(),
-            gravity_score: 3,
-            stage: 'interpret',
-            layer: 'raw',
-            meta: { tags: ['demo'] },
-          },
-        ]);
-      });
+    let ignore = false;
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await fetchSpiral(wellId);
+        console.log('Spiral response', data);
+        if (!ignore) setPoints(data.points || []);
+      } catch (err) {
+        console.error('Error fetching spiral', err);
+        if (!ignore) setError('Failed to load spiral');
+      } finally {
+        if (!ignore) setLoading(false);
+      }
+    };
+    load();
+    return () => {
+      ignore = true;
+    };
   }, [wellId]);
 
   const filtered = useMemo(() => {
@@ -72,14 +77,25 @@ export default function SpiralView({ wellId, onSelect }: Props) {
     <div className="bg-white dark:bg-gray-800 p-4 rounded shadow">
       <h2 className="font-semibold mb-2">SCADA Spiral View</h2>
       <SpiralFilters filters={filters} onChange={setFilters} />
-      <svg width={size} height={size} className="mx-auto block">
-        <AnimatePresence>
-          {sorted.map((p, i) => {
-            const angle = i * 0.5;
-            const radius = step * i + (60 - p.gravity_score * 10);
-            const x = center + radius * Math.cos(angle);
-            const y = center + radius * Math.sin(angle);
-            const color = p.stage === 'interpret' ? '#93c5fd' : '#facc15';
+      {loading && (
+        <div className="text-center py-8" data-testid="loading">
+          Loading spiral...
+        </div>
+      )}
+      {error && !loading && (
+        <div className="text-center text-red-500" data-testid="error">
+          {error}
+        </div>
+      )}
+      {!loading && !error && (
+        <svg width={size} height={size} className="mx-auto block">
+          <AnimatePresence>
+            {sorted.map((p, i) => {
+              const angle = i * 0.5;
+              const radius = step * i + (60 - p.gravity_score * 10);
+              const x = center + radius * Math.cos(angle);
+              const y = center + radius * Math.sin(angle);
+              const color = p.stage === 'interpret' ? '#93c5fd' : '#facc15';
             return (
               <motion.g
                 key={p.id}
@@ -115,8 +131,9 @@ export default function SpiralView({ wellId, onSelect }: Props) {
               </motion.g>
             );
           })}
-        </AnimatePresence>
-      </svg>
+          </AnimatePresence>
+        </svg>
+      )}
     </div>
   );
 }
